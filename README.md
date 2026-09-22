@@ -79,13 +79,3 @@ The digital lock was successfully synthesized and implemented on the DE2-115 FPG
 * Quartus Prime
 * ModelSim
 
-## Future Improvements
-
-* Multi-attempt lockout mechanism
-* Configurable password
-* Seven-segment display for input/status visualization
-* Password reset functionality
-* Additional security features
-
-Electronics & Communication Engineering
-VIT Vellore
