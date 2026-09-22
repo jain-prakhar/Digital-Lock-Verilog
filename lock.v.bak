@@ -1,0 +1,704 @@
+// digital_lock_vga_final.v
+// Final Digital Lock (VGA) for DE2-115
+// Password: 4 3 2 1 (change at top)
+// Entry mode: C1 (SW[3:0] per digit, press KEY0 to confirm digit)
+// VGA displays messages; HEX0..HEX3 show digits
+// KEY[0]=ENTER, KEY[1]=RESET, KEY[2]=CLEAR
+// Author: ChatGPT (final version)
+// Date: 2025-10-29
+
+`timescale 1ns/1ps
+module digital_lock_vga_final(
+    input  wire        CLOCK_50,
+    input  wire [3:0]  KEY,    // KEY[0]=ENTER, KEY[1]=RESET, KEY[2]=CLEAR
+    input  wire [3:0]  SW,     // SW[3:0] = nibble input (0..9)
+    output wire [9:0]  LEDR,   // LEDR[0]=LOCKED, LEDR[1]=UNLOCKED
+    output wire [6:0]  HEX0,
+    output wire [6:0]  HEX1,
+    output wire [6:0]  HEX2,
+    output wire [6:0]  HEX3,
+    output wire [6:0]  HEX4,
+    output wire [6:0]  HEX5,
+    // VGA outputs (should match DE2_115_Default.qsf pin names)
+    output wire [2:0]  VGA_R,
+    output wire [2:0]  VGA_G,
+    output wire [1:0]  VGA_B,
+    output wire        VGA_HS,
+    output wire        VGA_VS
+);
+
+    // ----------------------------
+    // PARAMETERS / DEFAULT PASSWORD
+    // ----------------------------
+    // Default password digits (D1 D2 D3 D4) — change here if needed
+    localparam [3:0] P0 = 4'd4;
+    localparam [3:0] P1 = 4'd3;
+    localparam [3:0] P2 = 4'd2;
+    localparam [3:0] P3 = 4'd1;
+
+    // ----------------------------
+    // CLOCKS & BUTTONS
+    // ----------------------------
+    wire clk = CLOCK_50;
+    wire enter_raw = ~KEY[0]; // active-high internal
+    wire reset_raw = ~KEY[1];
+    wire clear_raw = ~KEY[2];
+
+    // debounced / pulses
+    wire enter_db, enter_pulse;
+    wire clear_db, clear_pulse;
+    wire reset_db, reset_pulse;
+
+    // instantiate debouncers and one-pulse
+    debouncer #(.CLK_FREQ(50000000), .DEB_MS(20)) db_enter (.clk(clk), .reset(reset_raw), .noisy(enter_raw), .clean(enter_db));
+    one_pulse op_enter (.clk(clk), .reset(reset_raw), .sig(enter_db), .pulse(enter_pulse));
+
+    debouncer #(.CLK_FREQ(50000000), .DEB_MS(20)) db_clear (.clk(clk), .reset(reset_raw), .noisy(clear_raw), .clean(clear_db));
+    one_pulse op_clear (.clk(clk), .reset(reset_raw), .sig(clear_db), .pulse(clear_pulse));
+
+    debouncer #(.CLK_FREQ(50000000), .DEB_MS(20)) db_reset (.clk(clk), .reset(reset_raw), .noisy(reset_raw), .clean(reset_db));
+    one_pulse op_reset (.clk(clk), .reset(reset_raw), .sig(reset_db), .pulse(reset_pulse));
+
+    // long-press detection (optional for password change — we are not using it here)
+    reg [25:0] enter_hold_cnt;
+    reg enter_long;
+    reg enter_db_d;
+
+    // ----------------------------
+    // PASSWORD ENTRY STATE
+    // ----------------------------
+    reg [3:0] entered0, entered1, entered2, entered3; // entered0 is first entered digit
+    reg [1:0] count; // number of digits entered so far: 0..3
+    reg locked;      // 1 = locked, 0 = unlocked
+
+    // small timer for showing WRONG message
+    reg [23:0] wrong_timer;
+    reg show_wrong;
+
+    // initialize on reset
+    integer ii;
+    always @(posedge clk or posedge reset_raw) begin
+        if (reset_raw) begin
+            entered0 <= 4'd0;
+            entered1 <= 4'd0;
+            entered2 <= 4'd0;
+            entered3 <= 4'd0;
+            count <= 2'd0;
+            locked <= 1'b1;
+            wrong_timer <= 24'd0;
+            show_wrong <= 1'b0;
+            enter_hold_cnt <= 26'd0;
+            enter_long <= 1'b0;
+            enter_db_d <= 1'b0;
+        end else begin
+            // detect long press (not used as change mechanism here but kept safe)
+            enter_db_d <= enter_db;
+            if (enter_db) begin
+                if (enter_hold_cnt < 50_000_000) enter_hold_cnt <= enter_hold_cnt + 1;
+                else enter_long <= 1'b1;
+            end else begin
+                enter_hold_cnt <= 26'd0;
+                enter_long <= 1'b0;
+            end
+
+            // clear button resets entry and lock
+            if (clear_pulse) begin
+                entered0 <= 4'd0; entered1 <= 4'd0; entered2 <= 4'd0; entered3 <= 4'd0;
+                count <= 2'd0;
+                locked <= 1'b1;
+                show_wrong <= 1'b0;
+                wrong_timer <= 24'd0;
+            end else begin
+                // enter short-press: capture a digit (C1 mode)
+                if (enter_pulse) begin
+                    // shift digits to the right, newest goes into entered0
+                    entered3 <= entered2;
+                    entered2 <= entered1;
+                    entered1 <= entered0;
+                    entered0 <= SW & 4'hF; // capture SW[3:0]
+                    if (count < 2'd3) begin
+                        count <= count + 1'b1;
+                    end else begin
+                        // After entering 4th digit, check password
+                        if ({SW & 4'hF, entered0, entered1, entered2} == {P0, P1, P2, P3}) begin
+                            locked <= 1'b0; // correct
+                            show_wrong <= 1'b0;
+                            wrong_timer <= 24'd0;
+                        end else begin
+                            locked <= 1'b1;
+                            show_wrong <= 1'b1;
+                            wrong_timer <= 24'd1; // start timer (non-zero)
+                        end
+                        // reset entry counter to allow further attempts
+                        count <= 2'd0;
+                    end
+                end
+
+                // wrong message timer decrement (show wrong for ~0.1s)
+                if (show_wrong) begin
+                    if (wrong_timer < 24'd5_000_000) wrong_timer <= wrong_timer + 1;
+                    else begin
+                        show_wrong <= 1'b0;
+                        wrong_timer <= 24'd0;
+                        // clear entries for new attempt
+                        entered0 <= 4'd0; entered1 <= 4'd0; entered2 <= 4'd0; entered3 <= 4'd0;
+                    end
+                end
+            end
+        end
+    end
+
+    // ----------------------------
+    // LEDR mapping
+    // ----------------------------
+    assign LEDR[0] = locked;
+    assign LEDR[1] = ~locked;
+    assign LEDR[9:2] = 8'b0;
+
+    // ----------------------------
+    // HEX displays: show entered digits visually (E2 = visible)
+    // Active-low 7-seg & mirror fix included
+    // ----------------------------
+    function [6:0] seg7;
+        input [3:0] n;
+        begin
+            case(n)
+                4'd0: seg7 = 7'b1000000;
+                4'd1: seg7 = 7'b1111001;
+                4'd2: seg7 = 7'b0100100;
+                4'd3: seg7 = 7'b0110000;
+                4'd4: seg7 = 7'b0011001;
+                4'd5: seg7 = 7'b0010010;
+                4'd6: seg7 = 7'b0000010;
+                4'd7: seg7 = 7'b1111000;
+                4'd8: seg7 = 7'b0000000;
+                4'd9: seg7 = 7'b0010000;
+                default: seg7 = 7'b1111111;
+            endcase
+        end
+    endfunction
+
+    function [6:0] flip7;
+        input [6:0] s;
+        begin
+            flip7 = { s[6], s[4], s[5], s[3], s[1], s[2], s[0] };
+        end
+    endfunction
+
+    // Show the entered digits: if none entered yet, show blank
+    wire [6:0] hx0 = ( (count >= 0) ? seg7(entered0) : 7'b1111111 );
+    wire [6:0] hx1 = ( (count >= 1) ? seg7(entered1) : 7'b1111111 );
+    wire [6:0] hx2 = ( (count >= 2) ? seg7(entered2) : 7'b1111111 );
+    wire [6:0] hx3 = ( (count >= 3) ? seg7(entered3) : 7'b1111111 );
+
+    assign HEX0 = flip7(hx0);
+    assign HEX1 = flip7(hx1);
+    assign HEX2 = flip7(hx2);
+    assign HEX3 = flip7(hx3);
+    assign HEX4 = 7'b1111111;
+    assign HEX5 = 7'b1111111;
+
+    // ----------------------------
+    // VGA controller (640x480)
+    // Simple pixel clock: divide 50MHz -> 25MHz
+    // ----------------------------
+    reg pix;
+    always @(posedge clk) pix <= ~pix;
+
+    // VGA timing constants
+    localparam H_VISIBLE = 640;
+    localparam H_FRONT = 16;
+    localparam H_SYNC = 96;
+    localparam H_BACK = 48;
+    localparam H_TOTAL = 800;
+
+    localparam V_VISIBLE = 480;
+    localparam V_FRONT = 10;
+    localparam V_SYNC = 2;
+    localparam V_BACK = 33;
+    localparam V_TOTAL = 525;
+
+    reg [10:0] hcnt;
+    reg [9:0] vcnt;
+
+    always @(posedge pix) begin
+        if (hcnt == H_TOTAL-1) begin
+            hcnt <= 11'd0;
+            if (vcnt == V_TOTAL-1) vcnt <= 10'd0;
+            else vcnt <= vcnt + 1;
+        end else hcnt <= hcnt + 1;
+    end
+
+    wire hsync = ~((hcnt >= (H_VISIBLE + H_FRONT)) && (hcnt < (H_VISIBLE + H_FRONT + H_SYNC)));
+    wire vsync = ~((vcnt >= (V_VISIBLE + V_FRONT)) && (vcnt < (V_VISIBLE + V_FRONT + V_SYNC)));
+    assign VGA_HS = hsync;
+    assign VGA_VS = vsync;
+
+    wire visible = (hcnt < H_VISIBLE) && (vcnt < V_VISIBLE);
+
+    // character cell
+    localparam CHAR_W = 8;
+    localparam CHAR_H = 8;
+    wire [6:0] col = hcnt / CHAR_W; // 0..79
+    wire [5:0] row = vcnt / CHAR_H; // 0..59
+    wire [2:0] cx = hcnt[2:0]; // pixel x within char cell
+    wire [2:0] cy = vcnt[2:0]; // pixel y within char cell
+
+    // placement rows for three text lines
+    localparam TOP_ROW = 6;
+    localparam MID_ROW = 18;
+    localparam BOT_ROW = 26;
+
+    // font: 8x8 for necessary chars
+    function [7:0] font8;
+        input [7:0] ch;
+        input [2:0] r;
+        begin
+            font8 = 8'b00000000;
+            case (ch)
+                " ": font8 = 8'b00000000;
+                "W": case(r)
+                    3'd0: font8 = 8'b10000010;
+                    3'd1: font8 = 8'b10000010;
+                    3'd2: font8 = 8'b10010010;
+                    3'd3: font8 = 8'b10010010;
+                    3'd4: font8 = 8'b10010010;
+                    3'd5: font8 = 8'b01101100;
+                    3'd6: font8 = 8'b01000000;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "E": case(r)
+                    3'd0: font8 = 8'b11111111;
+                    3'd1: font8 = 8'b10000000;
+                    3'd2: font8 = 8'b10000000;
+                    3'd3: font8 = 8'b11111110;
+                    3'd4: font8 = 8'b10000000;
+                    3'd5: font8 = 8'b10000000;
+                    3'd6: font8 = 8'b11111111;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "L": case(r)
+                    3'd0: font8 = 8'b10000000;
+                    3'd1: font8 = 8'b10000000;
+                    3'd2: font8 = 8'b10000000;
+                    3'd3: font8 = 8'b10000000;
+                    3'd4: font8 = 8'b10000000;
+                    3'd5: font8 = 8'b10000010;
+                    3'd6: font8 = 8'b01111111;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "O": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000010;
+                    3'd2: font8 = 8'b10000001;
+                    3'd3: font8 = 8'b10000001;
+                    3'd4: font8 = 8'b10000001;
+                    3'd5: font8 = 8'b01000010;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "C": case(r)
+                    3'd0: font8 = 8'b00111110;
+                    3'd1: font8 = 8'b01000001;
+                    3'd2: font8 = 8'b10000000;
+                    3'd3: font8 = 8'b10000000;
+                    3'd4: font8 = 8'b10000000;
+                    3'd5: font8 = 8'b01000001;
+                    3'd6: font8 = 8'b00111110;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "K": case(r)
+                    3'd0: font8 = 8'b10000010;
+                    3'd1: font8 = 8'b10000100;
+                    3'd2: font8 = 8'b10001000;
+                    3'd3: font8 = 8'b10010000;
+                    3'd4: font8 = 8'b10001000;
+                    3'd5: font8 = 8'b10000100;
+                    3'd6: font8 = 8'b10000010;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "D": case(r)
+                    3'd0: font8 = 8'b11111100;
+                    3'd1: font8 = 8'b10000010;
+                    3'd2: font8 = 8'b10000001;
+                    3'd3: font8 = 8'b10000001;
+                    3'd4: font8 = 8'b10000001;
+                    3'd5: font8 = 8'b10000010;
+                    3'd6: font8 = 8'b11111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "T": case(r)
+                    3'd0: font8 = 8'b11111111;
+                    3'd1: font8 = 8'b00011000;
+                    3'd2: font8 = 8'b00011000;
+                    3'd3: font8 = 8'b00011000;
+                    3'd4: font8 = 8'b00011000;
+                    3'd5: font8 = 8'b00011000;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "WIDE_SPACE": font8 = 8'b00000000;
+                // digits 0..9 (simple)
+                "0": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000010;
+                    3'd2: font8 = 8'b10010001;
+                    3'd3: font8 = 8'b10100001;
+                    3'd4: font8 = 8'b11000001;
+                    3'd5: font8 = 8'b01000010;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "1": case(r)
+                    3'd0: font8 = 8'b00001000;
+                    3'd1: font8 = 8'b00011000;
+                    3'd2: font8 = 8'b00101000;
+                    3'd3: font8 = 8'b00001000;
+                    3'd4: font8 = 8'b00001000;
+                    3'd5: font8 = 8'b00001000;
+                    3'd6: font8 = 8'b00111110;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "2": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000010;
+                    3'd2: font8 = 8'b00000010;
+                    3'd3: font8 = 8'b00011100;
+                    3'd4: font8 = 8'b00100000;
+                    3'd5: font8 = 8'b01000000;
+                    3'd6: font8 = 8'b01111110;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "3": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000010;
+                    3'd2: font8 = 8'b00000010;
+                    3'd3: font8 = 8'b00011100;
+                    3'd4: font8 = 8'b00000010;
+                    3'd5: font8 = 8'b01000010;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "4": case(r)
+                    3'd0: font8 = 8'b00000100;
+                    3'd1: font8 = 8'b00001100;
+                    3'd2: font8 = 8'b00010100;
+                    3'd3: font8 = 8'b00100100;
+                    3'd4: font8 = 8'b01111110;
+                    3'd5: font8 = 8'b00000100;
+                    3'd6: font8 = 8'b00000100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "5": case(r)
+                    3'd0: font8 = 8'b01111110;
+                    3'd1: font8 = 8'b01000000;
+                    3'd2: font8 = 8'b01111100;
+                    3'd3: font8 = 8'b00000010;
+                    3'd4: font8 = 8'b00000010;
+                    3'd5: font8 = 8'b01000010;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "6": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000000;
+                    3'd2: font8 = 8'b10000000;
+                    3'd3: font8 = 8'b11111100;
+                    3'd4: font8 = 8'b10000010;
+                    3'd5: font8 = 8'b01000010;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "7": case(r)
+                    3'd0: font8 = 8'b01111110;
+                    3'd1: font8 = 8'b00000010;
+                    3'd2: font8 = 8'b00000100;
+                    3'd3: font8 = 8'b00001000;
+                    3'd4: font8 = 8'b00010000;
+                    3'd5: font8 = 8'b00010000;
+                    3'd6: font8 = 8'b00010000;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "8": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000010;
+                    3'd2: font8 = 8'b01000010;
+                    3'd3: font8 = 8'b00111100;
+                    3'd4: font8 = 8'b01000010;
+                    3'd5: font8 = 8'b01000010;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "9": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000010;
+                    3'd2: font8 = 8'b01000010;
+                    3'd3: font8 = 8'b00111110;
+                    3'd4: font8 = 8'b00000010;
+                    3'd5: font8 = 8'b00000010;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                // letters used in messages: "W","E","L","C","O","M","T","A","D","2","-","1","5", "U","N","S","P","R","G"
+                "M": case(r)
+                    3'd0: font8 = 8'b10000010;
+                    3'd1: font8 = 8'b11000110;
+                    3'd2: font8 = 8'b10101010;
+                    3'd3: font8 = 8'b10010010;
+                    3'd4: font8 = 8'b10000010;
+                    3'd5: font8 = 8'b10000010;
+                    3'd6: font8 = 8'b10000010;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "T": case(r)
+                    3'd0: font8 = 8'b11111111;
+                    3'd1: font8 = 8'b00011000;
+                    3'd2: font8 = 8'b00011000;
+                    3'd3: font8 = 8'b00011000;
+                    3'd4: font8 = 8'b00011000;
+                    3'd5: font8 = 8'b00011000;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "A": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000010;
+                    3'd2: font8 = 8'b10000001;
+                    3'd3: font8 = 8'b11111111;
+                    3'd4: font8 = 8'b10000001;
+                    3'd5: font8 = 8'b10000001;
+                    3'd6: font8 = 8'b10000001;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "R": case(r)
+                    3'd0: font8 = 8'b11111100;
+                    3'd1: font8 = 8'b10000010;
+                    3'd2: font8 = 8'b10000010;
+                    3'd3: font8 = 8'b11111100;
+                    3'd4: font8 = 8'b10100000;
+                    3'd5: font8 = 8'b10010000;
+                    3'd6: font8 = 8'b10001000;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "G": case(r)
+                    3'd0: font8 = 8'b00111100;
+                    3'd1: font8 = 8'b01000010;
+                    3'd2: font8 = 8'b10000000;
+                    3'd3: font8 = 8'b10001110;
+                    3'd4: font8 = 8'b10000010;
+                    3'd5: font8 = 8'b01000010;
+                    3'd6: font8 = 8'b00111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "S": case(r)
+                    3'd0: font8 = 8'b00111110;
+                    3'd1: font8 = 8'b01000000;
+                    3'd2: font8 = 8'b01000000;
+                    3'd3: font8 = 8'b00111100;
+                    3'd4: font8 = 8'b00000010;
+                    3'd5: font8 = 8'b00000010;
+                    3'd6: font8 = 8'b11111100;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "P": case(r)
+                    3'd0: font8 = 8'b11111100;
+                    3'd1: font8 = 8'b10000010;
+                    3'd2: font8 = 8'b10000010;
+                    3'd3: font8 = 8'b11111100;
+                    3'd4: font8 = 8'b10000000;
+                    3'd5: font8 = 8'b10000000;
+                    3'd6: font8 = 8'b10000000;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                "N": case(r)
+                    3'd0: font8 = 8'b10000010;
+                    3'd1: font8 = 8'b11000010;
+                    3'd2: font8 = 8'b10100010;
+                    3'd3: font8 = 8'b10010010;
+                    3'd4: font8 = 8'b10001010;
+                    3'd5: font8 = 8'b10000110;
+                    3'd6: font8 = 8'b10000010;
+                    3'd7: font8 = 8'b00000000;
+                endcase
+                default: font8 = 8'b00000000;
+            endcase
+        end
+    endfunction
+
+    // ----------------------------
+    // Character selection for top line (WELCOME TO ALTERA DE2-115)
+    // We'll center a 24-char string on the 80 columns
+    // ----------------------------
+    function [7:0] top_char;
+        input [5:0] idx; // 0..79 but we'll use 0..23
+        begin
+            case(idx)
+                6'd0: top_char = "W";
+                6'd1: top_char = "E";
+                6'd2: top_char = "L";
+                6'd3: top_char = "C";
+                6'd4: top_char = "O";
+                6'd5: top_char = "M";
+                6'd6: top_char = "E";
+                6'd7: top_char = " ";
+                6'd8: top_char = "T";
+                6'd9: top_char = "O";
+                6'd10: top_char = " ";
+                6'd11: top_char = "A";
+                6'd12: top_char = "L";
+                6'd13: top_char = "T";
+                6'd14: top_char = "E";
+                6'd15: top_char = "R";
+                6'd16: top_char = "A";
+                6'd17: top_char = " ";
+                6'd18: top_char = "D";
+                6'd19: top_char = "E";
+                6'd20: top_char = "2";
+                6'd21: top_char = "-";
+                6'd22: top_char = "1";
+                6'd23: top_char = "5";
+                default: top_char = " ";
+            endcase
+        end
+    endfunction
+
+    // ----------------------------
+    // Render loop: determine pixel_on for current px/py
+    // ----------------------------
+    reg pixel_on;
+    reg [7:0] cur_char;
+    integer left_col_top;
+    integer left_col_mid;
+    integer left_col_bot;
+    integer idx;
+    always @(*) begin
+        pixel_on = 1'b0;
+        cur_char = " ";
+        left_col_top = (80 - 24) / 2; // center 24 chars
+        // middle line: choose string based on state
+        // locked -> "LOCKED" (6), unlocked -> "UNLOCKED" (8), change mode not used here
+        // bottom line: show entered digits as "D1 D2 D3 D4" with underscores for empty
+        // compute which character cell we're in:
+        if (visible) begin
+            // compute which character column and row are active (combinational macros above used)
+            // col and row computed earlier as wires
+            // top row
+            if (row == TOP_ROW) begin
+                idx = col - left_col_top;
+                if ((idx >= 0) && (idx < 24)) cur_char = top_char(idx);
+                else cur_char = " ";
+                pixel_on = font8(cur_char, cy)[7-cx];
+            end
+            // middle row
+            else if (row == MID_ROW) begin
+                // center the status word
+                if (locked) begin
+                    left_col_mid = (80 - 6) / 2;
+                    idx = col - left_col_mid;
+                    case (idx)
+                        0: cur_char = "L"; 1: cur_char = "O"; 2: cur_char = "C";
+                        3: cur_char = "K"; 4: cur_char = "E"; 5: cur_char = "D";
+                        default: cur_char = " ";
+                    endcase
+                end else begin
+                    left_col_mid = (80 - 8) / 2;
+                    idx = col - left_col_mid;
+                    case (idx)
+                        0: cur_char = "U";1: cur_char = "N";2: cur_char = "L";3: cur_char = "O";
+                        4: cur_char = "C";5: cur_char = "K";6: cur_char = "E";7: cur_char = "D";
+                        default: cur_char = " ";
+                    endcase
+                end
+                pixel_on = font8(cur_char, cy)[7-cx];
+            end
+            // bottom row - entered digits visible (E2)
+            else if (row == BOT_ROW) begin
+                // show 4 chars with blanks/underscores centered
+                left_col_bot = (80 - 7) / 2; // we'll use pattern "_D_D_D_D" roughly width 7
+                idx = col - left_col_bot;
+                // mapping: idx 0:'[',1:d1,2:' ',3:d2,4:' ',5:d3,6:' ',7:d4
+                // simpler: place D1..D4 at positions 0..3 centered with spacing
+                left_col_bot = (80 - 7)/2;
+                idx = col - left_col_bot;
+                if (idx == 0) cur_char = " "; // spacer
+                else if (idx == 1) begin
+                    if (count >= 0) cur_char = (entered0 <= 4'd9) ? ("0" + entered0) : " ";
+                    else cur_char = "_";
+                end else if (idx == 2) cur_char = " ";
+                else if (idx == 3) begin
+                    if (count >= 1) cur_char = (entered1 <= 4'd9) ? ("0" + entered1) : " ";
+                    else cur_char = "_";
+                end else if (idx == 4) cur_char = " ";
+                else if (idx == 5) begin
+                    if (count >= 2) cur_char = (entered2 <= 4'd9) ? ("0" + entered2) : " ";
+                    else cur_char = "_";
+                end else if (idx == 6) cur_char = " ";
+                else if (idx == 7) begin
+                    if (count >= 3) cur_char = (entered3 <= 4'd9) ? ("0" + entered3) : " ";
+                    else cur_char = "_";
+                end else cur_char = " ";
+                pixel_on = font8(cur_char, cy)[7-cx];
+            end
+            else pixel_on = 1'b0;
+        end else pixel_on = 1'b0;
+    end
+
+    // ----------------------------
+    // Color outputs: white text on blue background
+    // ----------------------------
+    wire [2:0] color_r = (pixel_on ? 3'b111 : 3'b000);
+    wire [2:0] color_g = (pixel_on ? 3'b111 : 3'b000);
+    wire [1:0] color_b = (pixel_on ? 2'b11  : 2'b01); // slight blue background
+
+    assign VGA_R = color_r;
+    assign VGA_G = color_g;
+    assign VGA_B = color_b;
+
+endmodule
+
+// =====================================================
+// Debouncer & One-pulse modules (Verilog-2001 compatible)
+// =====================================================
+
+module debouncer #(
+    parameter CLK_FREQ = 50000000,
+    parameter DEB_MS = 20
+) (
+    input  wire clk,
+    input  wire reset,
+    input  wire noisy,
+    output reg  clean
+);
+    localparam integer COUNT_MAX = (CLK_FREQ/1000) * DEB_MS;
+    reg [31:0] counter;
+    reg sampled;
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            counter <= 32'd0;
+            sampled <= noisy;
+            clean <= noisy;
+        end else begin
+            if (noisy == sampled) begin
+                if (counter < COUNT_MAX) counter <= counter + 1;
+                else clean <= sampled;
+            end else begin
+                sampled <= noisy;
+                counter <= 32'd0;
+            end
+        end
+    end
+endmodule
+
+module one_pulse (
+    input  wire clk,
+    input  wire reset,
+    input  wire sig,
+    output wire pulse
+);
+    reg sig_d;
+    always @(posedge clk or posedge reset) begin
+        if (reset) sig_d <= 1'b0;
+        else sig_d <= sig;
+    end
+    assign pulse = sig & ~sig_d;
+endmodule
