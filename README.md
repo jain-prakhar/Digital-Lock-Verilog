@@ -62,23 +62,6 @@ The design was verified using simulation in **ModelSim** to test the different i
 
 The implementation was then synthesized using **Quartus Prime** and deployed on the DE2-115 board for hardware-level testing.
 
-## Project Structure
-
-```text
-Digital-Lock/
-│
-├── src/
-│   └── digital_lock.v
-│
-├── testbench/
-│   └── digital_lock_tb.v
-│
-├── quartus/
-│   └── <Quartus project files>
-│
-└── README.md
-```
-
 ## Results
 
 The digital lock was successfully synthesized and implemented on the DE2-115 FPGA. The lock state and corresponding status outputs were validated using the board's available input and output peripherals.
